@@ -363,6 +363,7 @@ class TestHybridStackMHC:
             ("fp32", False),
             ("bf16_fp32_mixing", False),
             ("bf16_fused", False),
+            ("bf16_fused_fp32_mixing", False),
             ("bf16_fp32_mixing", True),
         ],
     )
@@ -371,14 +372,16 @@ class TestHybridStackMHC:
         self, recompute_method, precision, learned_output_contract, autocast_forward
     ):
         dtype = torch.float32 if precision == "fp32" else torch.bfloat16
+        fused = precision in ("bf16_fused", "bf16_fused_fp32_mixing")
+        fp32_mixing = precision in ("bf16_fp32_mixing", "bf16_fused_fp32_mixing")
         config_kwargs = dict(
             num_layers=3,
             mhc_learned_output_contract=learned_output_contract,
             bf16=dtype == torch.bfloat16,
             params_dtype=dtype,
-            use_fused_mhc=precision == "bf16_fused",
-            mhc_norm_eps_inside_sqrt=precision == "bf16_fp32_mixing",
-            mhc_keep_mappings_in_fp32=precision == "bf16_fp32_mixing",
+            use_fused_mhc=fused,
+            mhc_norm_eps_inside_sqrt=fp32_mixing,
+            mhc_keep_mappings_in_fp32=fp32_mixing,
         )
         reference = _get_stack(_get_config(**config_kwargs), num_local_layers=3).cuda()
         config = _get_config(

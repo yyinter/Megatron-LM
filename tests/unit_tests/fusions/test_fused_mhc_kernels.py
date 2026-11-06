@@ -139,6 +139,7 @@ def _ref_proj_rms_compute_h(
     n: int,
     eps: float = 1e-6,
     compute_h_eps: float = 1e-6,
+    eps_inside_sqrt: bool = False,
 ):
     """Reference: fused proj_rms + compute_h."""
     proj = torch.matmul(x, weight.t())
@@ -147,7 +148,12 @@ def _ref_proj_rms_compute_h(
     r = norm / math.sqrt(K)  # [M, 1]
     N = proj.shape[-1]
     alpha = torch.cat([alpha_pre.expand(n), alpha_post.expand(n), alpha_res.expand(N - 2 * n)])
-    h = proj * alpha.unsqueeze(0) / (r + eps) + bias.unsqueeze(0)
+    if eps_inside_sqrt:
+        # mhc_norm_eps_inside_sqrt: rsqrt(mean(x**2) + eps) instead of 1 / (r + eps).
+        h = proj * alpha.unsqueeze(0) * torch.rsqrt(x.square().mean(dim=-1, keepdim=True) + eps)
+    else:
+        h = proj * alpha.unsqueeze(0) / (r + eps)
+    h = h + bias.unsqueeze(0)
     h_pre = h[..., :n].sigmoid() + compute_h_eps
     h_post = h[..., n : 2 * n].sigmoid() * 2
     h_res = h[..., 2 * n :]
@@ -690,14 +696,20 @@ class TestFusedProjRmsComputeH:
     """Public fused proj_rms_compute_h dispatch/fallback plus numerical correctness."""
 
     @pytest.mark.parametrize("M,n,K", [(256, 4, 4096), (64, 2, 512), (128, 4, 2048)])
-    def test_fwd_bwd_vs_reference(self, M, n, K):
+    # eps_inside_small_rows: rows with mean(x**2) ~ eps, where the two norm definitions
+    # differ by several x, so a kernel that ignored the flag would fail.
+    @pytest.mark.parametrize(
+        "eps_inside_sqrt,eps,scale",
+        [(False, 1e-6, 1.0), (True, 1e-5, 1.0), (True, 1e-5, 1e-2)],
+        ids=["eps_outside", "eps_inside", "eps_inside_small_rows"],
+    )
+    def test_fwd_bwd_vs_reference(self, M, n, K, eps_inside_sqrt, eps, scale):
         """E2E: public fused fwd output and bwd grads must match the PyTorch reference."""
         from megatron.core.fusions.fused_mhc_kernels import fused_proj_rms_compute_h
 
         _info()
         N = n * n + 2 * n
-        eps = 1e-6
-        x_data = _rand(M, K)
+        x_data = _rand(M, K) * scale
         w_data = _rand(N, K)
         ap_data = _rand(1)
         apo_data = _rand(1)
@@ -722,7 +734,7 @@ class TestFusedProjRmsComputeH:
         # -- fused path --
         xf, wf, apf, apof, arf, bf = _make_inputs()
         h_pre_f, h_post_f, h_res_f, r_f = fused_proj_rms_compute_h(
-            xf, wf, apf, apof, arf, bf, n, eps
+            xf, wf, apf, apof, arf, bf, n, eps, eps_inside_sqrt=eps_inside_sqrt
         )
         loss_f = (
             (h_pre_f * grad_h_pre).sum()
@@ -735,7 +747,7 @@ class TestFusedProjRmsComputeH:
         # -- reference path --
         xr, wr, apr, apor, arr, br = _make_inputs()
         h_pre_r, h_post_r, h_res_r, r_r = _ref_proj_rms_compute_h(
-            xr, wr, apr, apor, arr, br, n, eps
+            xr, wr, apr, apor, arr, br, n, eps, eps_inside_sqrt=eps_inside_sqrt
         )
         loss_r = (
             (h_pre_r * grad_h_pre).sum()
@@ -758,8 +770,12 @@ class TestFusedProjRmsComputeH:
         torch.testing.assert_close(
             xf.grad, xr.grad, atol=BWD_ATOL, rtol=BWD_RTOL, msg="backward mismatch on x"
         )
+        _assert_cosine_similar(xf.grad, xr.grad, COSINE_SIM_THRESH, msg="backward mismatch on x")
         torch.testing.assert_close(
             wf.grad, wr.grad, atol=BWD_ATOL, rtol=BWD_RTOL, msg="backward mismatch on weight"
+        )
+        _assert_cosine_similar(
+            wf.grad, wr.grad, COSINE_SIM_THRESH, msg="backward mismatch on weight"
         )
         _assert_cosine_similar(
             apf.grad, apr.grad, COSINE_SIM_THRESH, msg="backward mismatch on alpha_pre"
@@ -771,6 +787,97 @@ class TestFusedProjRmsComputeH:
             arf.grad, arr.grad, COSINE_SIM_THRESH, msg="backward mismatch on alpha_res"
         )
         _assert_cosine_similar(bf.grad, br.grad, COSINE_SIM_THRESH, msg="backward mismatch on bias")
+
+
+# ============================================================================
+# FP32 mappings with activation-dtype streams (mhc_keep_mappings_in_fp32)
+# ============================================================================
+
+_MIXING_BACKENDS = ["auto", "native"]
+if is_triton_available():
+    _MIXING_BACKENDS.append("triton")
+if is_cutile_available():
+    _MIXING_BACKENDS.append("cutile")
+
+
+class TestFusedMixingWithFp32Mappings:
+    """fused_h_aggregate / fused_h_post_bda with FP32 mappings and bf16 streams.
+
+    With ``mhc_keep_mappings_in_fp32`` the mappings reach the mixing kernels in FP32
+    while the residual streams stay in the activation dtype. Every backend must mix in
+    FP32 (the unfused arithmetic), write stream outputs in the stream dtype and return
+    mapping gradients in FP32.
+    """
+
+    @pytest.mark.parametrize("backend", _MIXING_BACKENDS)
+    @pytest.mark.parametrize("s,b,n,C", [(2, 4, 4, 1024), (3, 1, 2, 256)])
+    def test_h_aggregate(self, backend, s, b, n, C):
+        from megatron.core.fusions.fused_mhc_kernels import fused_h_aggregate
+
+        x_data = _rand(s, b, n, C)
+        h_data = torch.rand(s, b, n, dtype=torch.float32, device=DEVICE)
+        grad_out = _rand(s, b, C)
+
+        x = x_data.clone().requires_grad_(True)
+        h = h_data.clone().requires_grad_(True)
+        out = fused_h_aggregate(x, h, backend=backend)
+        assert out.dtype == DTYPE
+        out.backward(grad_out)
+        assert x.grad.dtype == DTYPE
+        assert h.grad.dtype == torch.float32
+
+        xr = x_data.clone().float().requires_grad_(True)
+        hr = h_data.clone().requires_grad_(True)
+        ref = _ref_h_aggregate(xr, hr)
+        ref.backward(grad_out.float())
+
+        torch.testing.assert_close(out, ref.to(DTYPE))
+        torch.testing.assert_close(x.grad, xr.grad.to(DTYPE))
+        torch.testing.assert_close(h.grad, hr.grad, atol=1e-5, rtol=1e-4)
+
+    @pytest.mark.parametrize("backend", _MIXING_BACKENDS)
+    @pytest.mark.parametrize("with_bias", [False, True])
+    @pytest.mark.parametrize("s,b,n,C", [(2, 4, 4, 1024), (3, 1, 2, 256)])
+    def test_h_post_bda(self, backend, with_bias, s, b, n, C):
+        from megatron.core.fusions.fused_mhc_kernels import fused_h_post_bda
+
+        h_res_data = torch.rand(s, b, n, n, dtype=torch.float32, device=DEVICE)
+        h_post_data = torch.rand(s, b, n, dtype=torch.float32, device=DEVICE)
+        orig_data = _rand(s, b, n, C)
+        x_data = _rand(s, b, C)
+        bias_data = _rand(C) if with_bias else None
+        grad_out = _rand(s, b, n, C)
+
+        h_res = h_res_data.clone().requires_grad_(True)
+        h_post = h_post_data.clone().requires_grad_(True)
+        orig = orig_data.clone().requires_grad_(True)
+        x = x_data.clone().requires_grad_(True)
+        bias = bias_data.clone().requires_grad_(True) if with_bias else None
+        out = fused_h_post_bda(h_res, orig, h_post, x, bias, backend=backend)
+        # The output re-enters the residual stream: stream dtype, not mapping dtype.
+        assert out.dtype == DTYPE
+        out.backward(grad_out)
+        assert h_res.grad.dtype == h_post.grad.dtype == torch.float32
+        assert orig.grad.dtype == x.grad.dtype == DTYPE
+
+        h_res_r = h_res_data.clone().requires_grad_(True)
+        h_post_r = h_post_data.clone().requires_grad_(True)
+        orig_r = orig_data.clone().float().requires_grad_(True)
+        x_r = x_data.clone().float().requires_grad_(True)
+        bias_r = bias_data.clone().float().requires_grad_(True) if with_bias else None
+        ref = _ref_h_post_bda(h_res_r, orig_r, h_post_r, x_r, bias_r)
+        ref.backward(grad_out.float())
+
+        torch.testing.assert_close(out, ref.to(DTYPE))
+        torch.testing.assert_close(orig.grad, orig_r.grad.to(DTYPE))
+        torch.testing.assert_close(x.grad, x_r.grad.to(DTYPE))
+        torch.testing.assert_close(h_res.grad, h_res_r.grad, atol=1e-5, rtol=1e-4)
+        torch.testing.assert_close(h_post.grad, h_post_r.grad, atol=1e-5, rtol=1e-4)
+        if with_bias:
+            assert bias.grad.dtype == DTYPE
+            # The fused backends reduce grad_bias over the s*b bf16-rounded rows of grad_x,
+            # so it only agrees with the FP32 reference at that resolution.
+            torch.testing.assert_close(bias.grad, bias_r.grad.to(DTYPE), atol=1e-2, rtol=2e-2)
 
 
 # ============================================================================

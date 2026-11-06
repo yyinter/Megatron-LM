@@ -154,16 +154,18 @@ def test_mhc_fused_backend_defaults_to_auto():
 
 
 @pytest.mark.parametrize("flag", ["mhc_norm_eps_inside_sqrt", "mhc_keep_mappings_in_fp32"])
-def test_mhc_fused_rejects_unsupported_precision_at_construction(flag):
-    with pytest.raises(ValueError, match="use_fused_mhc does not support"):
-        TransformerConfig(
-            num_layers=1,
-            hidden_size=128,
-            num_attention_heads=4,
-            enable_mhc_connections=True,
-            use_fused_mhc=True,
-            **{flag: True},
-        )
+def test_mhc_fused_accepts_precision_flags_at_construction(flag):
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        enable_mhc_connections=True,
+        use_fused_mhc=True,
+        **{flag: True},
+    )
+
+    assert config.use_fused_mhc
+    assert getattr(config, flag)
 
 
 def _make_dsa_kpool_config(**overrides) -> TransformerConfig:

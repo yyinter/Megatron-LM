@@ -526,30 +526,36 @@ def test_native_mhc_sinkhorn_checkpoint_replays_with_limited_compile_cache(compi
         torch._dynamo.reset()
 
 
+# Mappings in the stream dtype, or kept in FP32 (``mhc_keep_mappings_in_fp32``).
+_MHC_MAPPING_DTYPES = [torch.bfloat16, torch.float32]
+
+
 @pytest.mark.parametrize("backend", _MHC_BACKENDS)
-def test_mhc_h_aggregate_replays_fwd_bwd(backend):
+@pytest.mark.parametrize("mapping_dtype", _MHC_MAPPING_DTYPES)
+def test_mhc_h_aggregate_replays_fwd_bwd(backend, mapping_dtype):
     if backend == "triton" and not fused_mhc_kernels.is_triton_available():
         pytest.skip("Triton mHC backend unavailable")
     seeded()
     x = _mhc_rand(S, B, N, C)
-    h_pre = _mhc_rand(S, B, N)
+    h_pre = _mhc_rand(S, B, N, dtype=mapping_dtype)
     assert_replays_bit_exact(
         lambda x, h: fused_mhc_kernels.fused_h_aggregate(x, h, backend=backend),
         (x, h_pre),
         replays=3,
-        what=f"mhc h_aggregate[{backend}]",
+        what=f"mhc h_aggregate[{backend}, {mapping_dtype}]",
     )
 
 
 @pytest.mark.parametrize("backend", _MHC_BACKENDS)
 @pytest.mark.parametrize("with_bias", [False, True])
-def test_mhc_h_post_bda_replays_fwd_bwd(backend, with_bias):
+@pytest.mark.parametrize("mapping_dtype", _MHC_MAPPING_DTYPES)
+def test_mhc_h_post_bda_replays_fwd_bwd(backend, with_bias, mapping_dtype):
     if backend == "triton" and not fused_mhc_kernels.is_triton_available():
         pytest.skip("Triton mHC backend unavailable")
     seeded()
-    h_res = _mhc_rand(S, B, N, N)
+    h_res = _mhc_rand(S, B, N, N, dtype=mapping_dtype)
     orig = _mhc_rand(S, B, N, C)
-    h_post = _mhc_rand(S, B, N)
+    h_post = _mhc_rand(S, B, N, dtype=mapping_dtype)
     x = _mhc_rand(S, B, C)
     bias = _mhc_rand(C) if with_bias else None
 
@@ -557,13 +563,20 @@ def test_mhc_h_post_bda_replays_fwd_bwd(backend, with_bias):
         return fused_mhc_kernels.fused_h_post_bda(h_res, orig, h_post, x, bias, backend=backend)
 
     assert_replays_bit_exact(
-        run, (h_res, orig, h_post, x, bias), replays=3, what=f"mhc h_post_bda[{backend}]"
+        run,
+        (h_res, orig, h_post, x, bias),
+        replays=3,
+        what=f"mhc h_post_bda[{backend}, {mapping_dtype}]",
     )
 
 
 @pytest.mark.parametrize("backend", [b for b in _MHC_BACKENDS if b != "triton"])
-def test_mhc_proj_rms_compute_h_replays_fwd_bwd(backend):
-    """Projection + RMS + compute-h: cuTile fused kernel or the native ``torch.compile`` path."""
+@pytest.mark.parametrize("eps_inside_sqrt", [False, True])
+def test_mhc_proj_rms_compute_h_replays_fwd_bwd(backend, eps_inside_sqrt):
+    """Projection + RMS + compute-h: cuTile fused kernel or the native ``torch.compile`` path.
+
+    ``eps_inside_sqrt`` covers the ``mhc_norm_eps_inside_sqrt`` norm and its backward.
+    """
     seeded()
     n = N
     x = _mhc_rand(S * B, n * C)
@@ -575,14 +588,22 @@ def test_mhc_proj_rms_compute_h_replays_fwd_bwd(backend):
 
     def run(x, weight, alpha_pre, alpha_post, alpha_res, bias):
         return fused_mhc_kernels.fused_proj_rms_compute_h(
-            x, weight, alpha_pre, alpha_post, alpha_res, bias, n, backend=backend
+            x,
+            weight,
+            alpha_pre,
+            alpha_post,
+            alpha_res,
+            bias,
+            n,
+            eps_inside_sqrt=eps_inside_sqrt,
+            backend=backend,
         )
 
     assert_replays_bit_exact(
         run,
         (x, weight, alpha_pre, alpha_post, alpha_res, bias),
         replays=3,
-        what=f"mhc proj_rms_compute_h[{backend}]",
+        what=f"mhc proj_rms_compute_h[{backend}, eps_inside_sqrt={eps_inside_sqrt}]",
     )
 
 
